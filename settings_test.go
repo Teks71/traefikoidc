@@ -164,6 +164,99 @@ func TestConfigValidate(t *testing.T) {
 			expectedError: "logLevel must be one of: debug, info, error",
 		},
 		{
+			name: "Forwarded claim missing header",
+			config: &Config{
+				ProviderURL:          "https://provider.com",
+				CallbackURL:          "/callback",
+				ClientID:             "client-id",
+				ClientSecret:         "client-secret",
+				SessionEncryptionKey: "this-is-a-long-enough-encryption-key",
+				RateLimit:            10,
+				ForwardedClaims: map[string]*ForwardedClaimTarget{
+					"department": {},
+				},
+			},
+			expectedError: "forwardedClaims[department] must specify a header name",
+		},
+		{
+			name: "Forwarded claim reserved header",
+			config: &Config{
+				ProviderURL:          "https://provider.com",
+				CallbackURL:          "/callback",
+				ClientID:             "client-id",
+				ClientSecret:         "client-secret",
+				SessionEncryptionKey: "this-is-a-long-enough-encryption-key",
+				RateLimit:            10,
+				ForwardedClaims: map[string]*ForwardedClaimTarget{
+					"department": {
+						Header: "X-Forwarded-User",
+					},
+				},
+			},
+			expectedError: "forwardedClaims[department] header X-Forwarded-User conflicts with a reserved header",
+		},
+		{
+			name: "Forwarded claim duplicate header",
+			config: &Config{
+				ProviderURL:          "https://provider.com",
+				CallbackURL:          "/callback",
+				ClientID:             "client-id",
+				ClientSecret:         "client-secret",
+				SessionEncryptionKey: "this-is-a-long-enough-encryption-key",
+				RateLimit:            10,
+				ForwardedClaims: map[string]*ForwardedClaimTarget{
+					"department": {
+						Header: "X-Department",
+					},
+					"tenant": {
+						Header: "X-Department",
+					},
+				},
+			},
+			expectedError: "forwardedClaims header X-Department is already used for claims department and tenant",
+		},
+		{
+			name: "Forwarded claim invalid encryption key",
+			config: &Config{
+				ProviderURL:          "https://provider.com",
+				CallbackURL:          "/callback",
+				ClientID:             "client-id",
+				ClientSecret:         "client-secret",
+				SessionEncryptionKey: "this-is-a-long-enough-encryption-key",
+				RateLimit:            10,
+				ForwardedClaims: map[string]*ForwardedClaimTarget{
+					"department": {
+						Header: "X-Department",
+						Encryption: &ForwardedClaimEncryptionConfig{
+							Key: "short",
+						},
+					},
+				},
+			},
+			expectedError: "forwardedClaims[department] encryption key is invalid: encryption key must be 16, 24, or 32 bytes long, got 5",
+		},
+		{
+			name: "Forwarded claim invalid hmac algorithm",
+			config: &Config{
+				ProviderURL:          "https://provider.com",
+				CallbackURL:          "/callback",
+				ClientID:             "client-id",
+				ClientSecret:         "client-secret",
+				SessionEncryptionKey: "this-is-a-long-enough-encryption-key",
+				RateLimit:            10,
+				ForwardedClaims: map[string]*ForwardedClaimTarget{
+					"department": {
+						Header: "X-Department",
+						HMAC: &ForwardedClaimHMACConfig{
+							Secret:    "secret",
+							Algorithm: "HS512",
+						},
+					},
+				},
+			},
+			expectedError: "forwardedClaims[department] hmac algorithm must be HS256",
+		},
+		{
 			name: "Non-HTTPS RevocationURL",
 			config: &Config{
 				ProviderURL:          "https://provider.com",
@@ -199,6 +292,21 @@ func TestConfigValidate(t *testing.T) {
 				RateLimit:            100,
 				RevocationURL:        "https://revoke.com",
 				OIDCEndSessionURL:    "https://endsession.com",
+				ForwardedClaims: map[string]*ForwardedClaimTarget{
+					"department": {
+						Header: "X-Department",
+						HMAC: &ForwardedClaimHMACConfig{
+							Secret: "super-secret-key",
+						},
+						Encryption: &ForwardedClaimEncryptionConfig{
+							Key:    "0123456789abcdef0123456789abcdef",
+							Header: "X-Department-Encrypted",
+						},
+					},
+					"tenant.id": {
+						Header: "X-Tenant",
+					},
+				},
 			},
 			expectedError: "",
 		},

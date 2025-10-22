@@ -1,12 +1,15 @@
 package traefikoidc
 
 import (
+	"encoding/base64"
+	"encoding/json"
 	"fmt"
 	"io"
 	"log"
 	"net/http"
 	"net/url"
 	"os"
+	"sort"
 	"strings"
 )
 
@@ -84,6 +87,64 @@ type Config struct {
 
 	// HTTPClient allows customizing the HTTP client used for OIDC operations (optional)
 	HTTPClient *http.Client
+
+	// ForwardedClaims configures additional claims that should be forwarded to the upstream service as headers.
+	ForwardedClaims map[string]*ForwardedClaimTarget `json:"forwardedClaims"`
+}
+
+var reservedForwardedHeaders = map[string]struct{}{
+	strings.ToLower("X-Forwarded-User"):        {},
+	strings.ToLower("X-User-Groups"):           {},
+	strings.ToLower("X-User-Roles"):            {},
+	strings.ToLower("X-Auth-Request-Redirect"): {},
+	strings.ToLower("X-Auth-Request-User"):     {},
+	strings.ToLower("X-Auth-Request-Token"):    {},
+}
+
+// ForwardedClaimTarget defines how a single claim should be forwarded to downstream services.
+// It supports optional HMAC signing or encryption for additional security.
+type ForwardedClaimTarget struct {
+	Header     string                          `json:"header"`
+	HMAC       *ForwardedClaimHMACConfig       `json:"hmac,omitempty"`
+	Encryption *ForwardedClaimEncryptionConfig `json:"encryption,omitempty"`
+}
+
+// ForwardedClaimHMACConfig specifies how to sign forwarded claim values.
+type ForwardedClaimHMACConfig struct {
+	Secret    string `json:"secret"`
+	Header    string `json:"header"`
+	Algorithm string `json:"algorithm"`
+}
+
+// ForwardedClaimEncryptionConfig specifies how to encrypt forwarded claim values.
+type ForwardedClaimEncryptionConfig struct {
+	Key    string `json:"key"`
+	Header string `json:"header"`
+}
+
+// UnmarshalJSON allows the forwarded claim target to be defined as either a string (header name)
+// or a structured object with additional security configuration.
+func (f *ForwardedClaimTarget) UnmarshalJSON(data []byte) error {
+	type alias ForwardedClaimTarget
+	if len(data) == 0 {
+		return nil
+	}
+
+	if data[0] == '"' {
+		var header string
+		if err := json.Unmarshal(data, &header); err != nil {
+			return err
+		}
+		f.Header = header
+		return nil
+	}
+
+	var a alias
+	if err := json.Unmarshal(data, &a); err != nil {
+		return err
+	}
+	*f = ForwardedClaimTarget(a)
+	return nil
 }
 
 const (
@@ -197,7 +258,112 @@ func (c *Config) Validate() error {
 		return fmt.Errorf("rateLimit must be at least %d", MinRateLimit)
 	}
 
+	// Validate forwarded claims configuration
+	if len(c.ForwardedClaims) > 0 {
+		usedHeaders := make(map[string]string)
+		for claimPath, target := range c.ForwardedClaims {
+			if target == nil {
+				return fmt.Errorf("forwardedClaims entry for %s is invalid", claimPath)
+			}
+
+			if strings.TrimSpace(claimPath) == "" {
+				return fmt.Errorf("forwardedClaims keys must not be empty")
+			}
+
+			headerName := strings.TrimSpace(target.Header)
+			if headerName == "" {
+				return fmt.Errorf("forwardedClaims[%s] must specify a header name", claimPath)
+			}
+
+			if err := c.validateForwardedHeader(claimPath, headerName, usedHeaders); err != nil {
+				return err
+			}
+
+			if target.HMAC != nil {
+				if strings.TrimSpace(target.HMAC.Secret) == "" {
+					return fmt.Errorf("forwardedClaims[%s] hmac secret must not be empty", claimPath)
+				}
+
+				if target.HMAC.Algorithm != "" && !strings.EqualFold(target.HMAC.Algorithm, "HS256") {
+					return fmt.Errorf("forwardedClaims[%s] hmac algorithm must be HS256", claimPath)
+				}
+
+				if _, err := decodeKeyMaterial(target.HMAC.Secret); err != nil {
+					return fmt.Errorf("forwardedClaims[%s] hmac secret is invalid: %w", claimPath, err)
+				}
+
+				signatureHeader := target.HMAC.Header
+				if signatureHeader == "" {
+					signatureHeader = headerName + "-Signature"
+				}
+				if err := c.validateForwardedHeader(claimPath, signatureHeader, usedHeaders); err != nil {
+					return err
+				}
+			}
+
+			if target.Encryption != nil {
+				if strings.TrimSpace(target.Encryption.Key) == "" {
+					return fmt.Errorf("forwardedClaims[%s] encryption key must not be empty", claimPath)
+				}
+
+				if _, err := decodeEncryptionKey(target.Encryption.Key); err != nil {
+					return fmt.Errorf("forwardedClaims[%s] encryption key is invalid: %w", claimPath, err)
+				}
+
+				encryptionHeader := target.Encryption.Header
+				if encryptionHeader == "" {
+					encryptionHeader = headerName + "-Encrypted"
+				}
+				if err := c.validateForwardedHeader(claimPath, encryptionHeader, usedHeaders); err != nil {
+					return err
+				}
+			}
+		}
+	}
+
 	return nil
+}
+
+func (c *Config) validateForwardedHeader(claimPath, headerName string, usedHeaders map[string]string) error {
+	normalized := strings.ToLower(headerName)
+	if _, reserved := reservedForwardedHeaders[normalized]; reserved {
+		return fmt.Errorf("forwardedClaims[%s] header %s conflicts with a reserved header", claimPath, headerName)
+	}
+
+	if existing, exists := usedHeaders[normalized]; exists {
+		claims := []string{existing, claimPath}
+		sort.Strings(claims)
+		return fmt.Errorf("forwardedClaims header %s is already used for claims %s and %s", headerName, claims[0], claims[1])
+	}
+
+	usedHeaders[normalized] = claimPath
+	return nil
+}
+
+func decodeKeyMaterial(value string) ([]byte, error) {
+	if value == "" {
+		return nil, fmt.Errorf("key material is empty")
+	}
+
+	if decoded, err := base64.StdEncoding.DecodeString(value); err == nil && len(decoded) > 0 {
+		return decoded, nil
+	}
+
+	return []byte(value), nil
+}
+
+func decodeEncryptionKey(value string) ([]byte, error) {
+	key, err := decodeKeyMaterial(value)
+	if err != nil {
+		return nil, err
+	}
+
+	switch len(key) {
+	case 16, 24, 32:
+		return key, nil
+	default:
+		return nil, fmt.Errorf("encryption key must be 16, 24, or 32 bytes long, got %d", len(key))
+	}
 }
 
 // isValidSecureURL checks if the provided string is a valid HTTPS URL

@@ -3,6 +3,8 @@ package traefikoidc
 import (
 	"context"
 	"crypto"
+	"crypto/aes"
+	"crypto/cipher"
 	"crypto/ecdsa"
 	"crypto/elliptic"
 	"crypto/rand"
@@ -1294,7 +1296,6 @@ func TestHandleExpiredToken(t *testing.T) {
 	}
 }
 
-// Add this new test function
 func TestExtractGroupsAndRoles(t *testing.T) {
 	ts := &TestSuite{t: t}
 	ts.Setup()
@@ -1314,7 +1315,6 @@ func TestExtractGroupsAndRoles(t *testing.T) {
 			},
 			expectGroups: []string{"group1", "group2"},
 			expectRoles:  []string{"role1", "role2"},
-			expectError:  false,
 		},
 		{
 			name: "Empty groups and roles",
@@ -1324,7 +1324,6 @@ func TestExtractGroupsAndRoles(t *testing.T) {
 			},
 			expectGroups: []string{},
 			expectRoles:  []string{},
-			expectError:  false,
 		},
 		{
 			name: "Invalid groups format",
@@ -1338,34 +1337,136 @@ func TestExtractGroupsAndRoles(t *testing.T) {
 
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
-			// Create a test token with the claims
 			token, err := createTestJWT(ts.rsaPrivateKey, "RS256", "test-key-id", tc.claims)
 			if err != nil {
 				t.Fatalf("Failed to create test token: %v", err)
 			}
 
 			groups, roles, err := ts.tOidc.extractGroupsAndRoles(token)
-
 			if tc.expectError {
 				if err == nil {
 					t.Error("Expected error but got nil")
 				}
-			} else {
-				if err != nil {
-					t.Errorf("Unexpected error: %v", err)
-				}
+				return
+			}
 
-				// Compare groups
-				if !stringSliceEqual(groups, tc.expectGroups) {
-					t.Errorf("Expected groups %v, got %v", tc.expectGroups, groups)
-				}
+			if err != nil {
+				t.Fatalf("Unexpected error: %v", err)
+			}
 
-				// Compare roles
-				if !stringSliceEqual(roles, tc.expectRoles) {
-					t.Errorf("Expected roles %v, got %v", tc.expectRoles, roles)
-				}
+			if !stringSliceEqual(groups, tc.expectGroups) {
+				t.Errorf("Expected groups %v, got %v", tc.expectGroups, groups)
+			}
+
+			if !stringSliceEqual(roles, tc.expectRoles) {
+				t.Errorf("Expected roles %v, got %v", tc.expectRoles, roles)
 			}
 		})
+	}
+}
+
+func TestApplyForwardedClaims(t *testing.T) {
+	logger := NewLogger("info")
+
+	deptTokens, err := parseClaimPath("department")
+	if err != nil {
+		t.Fatalf("failed to parse department path: %v", err)
+	}
+
+	tenantTokens, err := parseClaimPath("tenant.id")
+	if err != nil {
+		t.Fatalf("failed to parse tenant path: %v", err)
+	}
+
+	featureTokens, err := parseClaimPath("features")
+	if err != nil {
+		t.Fatalf("failed to parse features path: %v", err)
+	}
+
+	encryptionKey := []byte("0123456789abcdef0123456789abcdef")
+
+	tOidc := &TraefikOidc{
+		logger: logger,
+		forwardedClaims: []*forwardedClaimDefinition{
+			{
+				path:       "department",
+				header:     "X-Department",
+				tokens:     deptTokens,
+				hmacHeader: "X-Department-Signature",
+				hmacSecret: []byte("signing-secret"),
+			},
+			{
+				path:             "tenant.id",
+				header:           "X-Tenant",
+				tokens:           tenantTokens,
+				encryptionHeader: "X-Tenant-Encrypted",
+				encryptionKey:    encryptionKey,
+			},
+			{
+				path:   "features",
+				header: "X-Features",
+				tokens: featureTokens,
+			},
+		},
+	}
+
+	claims := map[string]interface{}{
+		"department": "Engineering",
+		"tenant": map[string]interface{}{
+			"id": "tenant-42",
+		},
+		"features": []interface{}{"alpha", "beta"},
+	}
+
+	req := httptest.NewRequest("GET", "/", nil)
+	tOidc.applyForwardedClaims(req, claims)
+
+	if got := req.Header.Get("X-Department"); got != "Engineering" {
+		t.Fatalf("expected department header to be Engineering, got %s", got)
+	}
+
+	expectedSignature := computeHMACSignature([]byte("signing-secret"), "Engineering")
+	if got := req.Header.Get("X-Department-Signature"); got != expectedSignature {
+		t.Fatalf("expected signature %s, got %s", expectedSignature, got)
+	}
+
+	if got := req.Header.Get("X-Tenant"); got != "tenant-42" {
+		t.Fatalf("expected tenant header tenant-42, got %s", got)
+	}
+
+	encrypted := req.Header.Get("X-Tenant-Encrypted")
+	if encrypted == "" {
+		t.Fatal("expected encrypted tenant header to be set")
+	}
+
+	decoded, err := base64.StdEncoding.DecodeString(encrypted)
+	if err != nil {
+		t.Fatalf("failed to decode encrypted header: %v", err)
+	}
+
+	block, err := aes.NewCipher(encryptionKey)
+	if err != nil {
+		t.Fatalf("failed to initialize cipher: %v", err)
+	}
+	gcm, err := cipher.NewGCM(block)
+	if err != nil {
+		t.Fatalf("failed to initialize GCM: %v", err)
+	}
+	if len(decoded) <= gcm.NonceSize() {
+		t.Fatalf("decoded payload too short: %d", len(decoded))
+	}
+	nonce := decoded[:gcm.NonceSize()]
+	ciphertext := decoded[gcm.NonceSize():]
+	plaintext, err := gcm.Open(nil, nonce, ciphertext, nil)
+	if err != nil {
+		t.Fatalf("failed to decrypt header: %v", err)
+	}
+	if string(plaintext) != "tenant-42" {
+		t.Fatalf("expected decrypted tenant value tenant-42, got %s", string(plaintext))
+	}
+
+	if got := req.Header.Get("X-Features"); got != "alpha,beta" {
+		t.Fatalf("expected features header alpha,beta, got %s", got)
 	}
 }
 
