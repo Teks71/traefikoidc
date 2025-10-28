@@ -446,7 +446,7 @@ forwardedClaims:
   features: X-User-Features
 ```
 
-Values are normalised to strings. Arrays become comma-separated lists and nested objects can be targeted via dot-paths (for example, `tenant.id`). When signing is enabled, an `HS256` signature is generated using the provided secret. When encryption is enabled, the plaintext header is still set and an encrypted version is emitted alongside it using AES-GCM with a random nonce encoded in base64.
+Values are normalised to strings. Arrays become comma-separated lists and nested objects can be targeted via dot-paths (for example, `tenant.id`). Claims that resolve to empty strings are skipped so that headers from previous requests are not reused. When signing is enabled, an `HS256` signature is generated using the provided secret. When encryption is enabled, the plaintext header is still set and an encrypted version is emitted alongside it using AES-GCM with a random nonce encoded in base64.
 
 ### Security Headers
 

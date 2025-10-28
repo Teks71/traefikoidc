@@ -1383,6 +1383,11 @@ func TestApplyForwardedClaims(t *testing.T) {
 		t.Fatalf("failed to parse features path: %v", err)
 	}
 
+	emptyTokens, err := parseClaimPath("metadata.empty")
+	if err != nil {
+		t.Fatalf("failed to parse empty path: %v", err)
+	}
+
 	encryptionKey := []byte("0123456789abcdef0123456789abcdef")
 
 	tOidc := &TraefikOidc{
@@ -1407,6 +1412,13 @@ func TestApplyForwardedClaims(t *testing.T) {
 				header: "X-Features",
 				tokens: featureTokens,
 			},
+			{
+				path:       "metadata.empty",
+				header:     "X-Empty",
+				tokens:     emptyTokens,
+				hmacHeader: "X-Empty-Signature",
+				hmacSecret: []byte("secret"),
+			},
 		},
 	}
 
@@ -1416,6 +1428,9 @@ func TestApplyForwardedClaims(t *testing.T) {
 			"id": "tenant-42",
 		},
 		"features": []interface{}{"alpha", "beta"},
+		"metadata": map[string]interface{}{
+			"empty": "   ",
+		},
 	}
 
 	req := httptest.NewRequest("GET", "/", nil)
@@ -1467,6 +1482,13 @@ func TestApplyForwardedClaims(t *testing.T) {
 
 	if got := req.Header.Get("X-Features"); got != "alpha,beta" {
 		t.Fatalf("expected features header alpha,beta, got %s", got)
+	}
+
+	if _, exists := req.Header["X-Empty"]; exists {
+		t.Fatal("expected empty claim header to be omitted")
+	}
+	if _, exists := req.Header["X-Empty-Signature"]; exists {
+		t.Fatal("expected empty claim signature header to be omitted")
 	}
 }
 

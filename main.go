@@ -757,6 +757,11 @@ func (t *TraefikOidc) applyForwardedClaims(req *http.Request, claims map[string]
 			continue
 		}
 
+		if normalized == "" {
+			t.logger.Debugf("Skipping forwarded claim %s because value is empty", def.path)
+			continue
+		}
+
 		req.Header.Set(def.header, normalized)
 
 		if len(def.hmacSecret) > 0 {
