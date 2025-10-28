@@ -429,6 +429,25 @@ When a user is authenticated, the middleware sets the following headers for down
 - `X-Auth-Request-User`: The user's email address
 - `X-Auth-Request-Token`: The user's access token
 
+You can forward additional claims from the ID or access token to downstream services using the `forwardedClaims` configuration block. Each entry maps a claim (supports dot-notation and array indexes) to a header name. Optional HMAC signatures and AES-GCM encryption can be enabled per claim to allow downstream services to verify the provenance of the data.
+
+```yaml
+forwardedClaims:
+  department:
+    header: X-User-Department
+    hmac:
+      secret: super-secret-signing-key
+      header: X-User-Department-Signature # optional, defaults to <header>-Signature
+  tenant.id:
+    header: X-Tenant
+    encryption:
+      key: 0123456789abcdef0123456789abcdef
+      header: X-Tenant-Encrypted # optional, defaults to <header>-Encrypted
+  features: X-User-Features
+```
+
+Values are normalised to strings. Arrays become comma-separated lists and nested objects can be targeted via dot-paths (for example, `tenant.id`). Claims that resolve to empty strings are skipped so that headers from previous requests are not reused. When signing is enabled, an `HS256` signature is generated using the provided secret. When encryption is enabled, the plaintext header is still set and an encrypted version is emitted alongside it using AES-GCM with a random nonce encoded in base64.
+
 ### Security Headers
 
 The middleware also sets the following security headers:

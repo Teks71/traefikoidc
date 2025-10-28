@@ -2,6 +2,12 @@ package traefikoidc
 
 import (
 	"context"
+	"crypto/aes"
+	"crypto/cipher"
+	"crypto/hmac"
+	"crypto/rand"
+	"crypto/sha256"
+	"encoding/base64"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -9,6 +15,8 @@ import (
 	"net"
 	"net/http"
 	"net/url"
+	"sort"
+	"strconv"
 	"strings"
 	"time"
 
@@ -100,6 +108,22 @@ type TraefikOidc struct {
 	endSessionURL              string
 	postLogoutRedirectURI      string
 	sessionManager             *SessionManager
+	forwardedClaims            []*forwardedClaimDefinition
+}
+
+type forwardedClaimDefinition struct {
+	path             string
+	header           string
+	tokens           []claimPathToken
+	hmacHeader       string
+	hmacSecret       []byte
+	encryptionHeader string
+	encryptionKey    []byte
+}
+
+type claimPathToken struct {
+	key   string
+	index *int
 }
 
 // ProviderMetadata holds OIDC provider metadata
@@ -312,6 +336,55 @@ func New(ctx context.Context, next http.Handler, config *Config, name string) (h
 		allowedRolesAndGroups: createStringMap(config.AllowedRolesAndGroups),
 		initComplete:          make(chan struct{}),
 		logger:                logger,
+	}
+
+	if len(config.ForwardedClaims) > 0 {
+		claimPaths := make([]string, 0, len(config.ForwardedClaims))
+		for path := range config.ForwardedClaims {
+			claimPaths = append(claimPaths, path)
+		}
+		sort.Strings(claimPaths)
+
+		for _, path := range claimPaths {
+			target := config.ForwardedClaims[path]
+			tokens, err := parseClaimPath(path)
+			if err != nil {
+				return nil, fmt.Errorf("invalid forwarded claim path %s: %w", path, err)
+			}
+
+			header := strings.TrimSpace(target.Header)
+			def := &forwardedClaimDefinition{
+				path:   path,
+				header: header,
+				tokens: tokens,
+			}
+
+			if target.HMAC != nil {
+				secret, err := decodeKeyMaterial(target.HMAC.Secret)
+				if err != nil {
+					return nil, fmt.Errorf("failed to decode HMAC secret for forwarded claim %s: %w", path, err)
+				}
+				def.hmacSecret = secret
+				def.hmacHeader = target.HMAC.Header
+				if def.hmacHeader == "" {
+					def.hmacHeader = header + "-Signature"
+				}
+			}
+
+			if target.Encryption != nil {
+				key, err := decodeEncryptionKey(target.Encryption.Key)
+				if err != nil {
+					return nil, fmt.Errorf("failed to decode encryption key for forwarded claim %s: %w", path, err)
+				}
+				def.encryptionKey = key
+				def.encryptionHeader = target.Encryption.Header
+				if def.encryptionHeader == "" {
+					def.encryptionHeader = header + "-Encrypted"
+				}
+			}
+
+			t.forwardedClaims = append(t.forwardedClaims, def)
+		}
 	}
 
 	t.sessionManager, _ = NewSessionManager(config.SessionEncryptionKey, config.ForceHTTPS, t.logger)
@@ -558,16 +631,35 @@ func (t *TraefikOidc) ServeHTTP(rw http.ResponseWriter, req *http.Request) {
 		return
 	}
 
-	groups, roles, err := t.extractGroupsAndRoles(session.GetAccessToken())
-	if err != nil {
-		t.logger.Errorf("Failed to extract groups and roles: %v", err)
+	idToken := session.GetAccessToken()
+	var claims map[string]interface{}
+	if idToken != "" {
+		claims, err = t.extractClaimsFunc(idToken)
+		if err != nil {
+			t.logger.Errorf("Failed to extract claims: %v", err)
+		}
+	}
+
+	var groups []string
+	var roles []string
+	if claims != nil {
+		groups, roles, err = t.extractGroupsAndRolesFromClaims(claims)
+		if err != nil {
+			t.logger.Errorf("Failed to extract groups and roles: %v", err)
+		}
 	} else {
-		if len(groups) > 0 {
-			req.Header.Set("X-User-Groups", strings.Join(groups, ","))
-		}
-		if len(roles) > 0 {
-			req.Header.Set("X-User-Roles", strings.Join(roles, ","))
-		}
+		groups, roles = nil, nil
+	}
+
+	if len(groups) > 0 {
+		req.Header.Set("X-User-Groups", strings.Join(groups, ","))
+	}
+	if len(roles) > 0 {
+		req.Header.Set("X-User-Roles", strings.Join(roles, ","))
+	}
+
+	if len(t.forwardedClaims) > 0 && claims != nil {
+		t.applyForwardedClaims(req, claims)
 	}
 
 	// Check allowed roles and groups
@@ -650,6 +742,192 @@ func (t *TraefikOidc) determineHost(req *http.Request) string {
 		return host
 	}
 	return req.Host
+}
+
+func (t *TraefikOidc) applyForwardedClaims(req *http.Request, claims map[string]interface{}) {
+	for _, def := range t.forwardedClaims {
+		value, ok := extractClaimValue(claims, def.tokens)
+		if !ok {
+			continue
+		}
+
+		normalized, ok := normalizeClaimValue(value)
+		if !ok {
+			t.logger.Debugf("Skipping forwarded claim %s due to unsupported value type", def.path)
+			continue
+		}
+
+		if normalized == "" {
+			t.logger.Debugf("Skipping forwarded claim %s because value is empty", def.path)
+			continue
+		}
+
+		req.Header.Set(def.header, normalized)
+
+		if len(def.hmacSecret) > 0 {
+			signature := computeHMACSignature(def.hmacSecret, normalized)
+			req.Header.Set(def.hmacHeader, signature)
+		}
+
+		if len(def.encryptionKey) > 0 {
+			encrypted, err := encryptForwardedValue(def.encryptionKey, normalized)
+			if err != nil {
+				t.logger.Errorf("Failed to encrypt forwarded claim %s: %v", def.path, err)
+				continue
+			}
+			req.Header.Set(def.encryptionHeader, encrypted)
+		}
+	}
+}
+
+func extractClaimValue(root map[string]interface{}, tokens []claimPathToken) (interface{}, bool) {
+	var current interface{} = root
+	for _, token := range tokens {
+		if token.key != "" {
+			obj, ok := current.(map[string]interface{})
+			if !ok {
+				return nil, false
+			}
+			next, exists := obj[token.key]
+			if !exists {
+				return nil, false
+			}
+			current = next
+		}
+
+		if token.index != nil {
+			arr, ok := current.([]interface{})
+			if !ok {
+				return nil, false
+			}
+			idx := *token.index
+			if idx < 0 || idx >= len(arr) {
+				return nil, false
+			}
+			current = arr[idx]
+		}
+	}
+	return current, true
+}
+
+func normalizeClaimValue(value interface{}) (string, bool) {
+	switch v := value.(type) {
+	case string:
+		return strings.TrimSpace(v), true
+	case float64:
+		if math.Trunc(v) == v {
+			return strconv.FormatInt(int64(v), 10), true
+		}
+		return strconv.FormatFloat(v, 'f', -1, 64), true
+	case bool:
+		return strconv.FormatBool(v), true
+	case []interface{}:
+		parts := make([]string, 0, len(v))
+		for _, item := range v {
+			normalized, ok := normalizeClaimValue(item)
+			if !ok {
+				return "", false
+			}
+			if normalized != "" {
+				parts = append(parts, normalized)
+			}
+		}
+		return strings.Join(parts, ","), true
+	case map[string]interface{}:
+		data, err := json.Marshal(v)
+		if err != nil {
+			return "", false
+		}
+		return string(data), true
+	case nil:
+		return "", false
+	default:
+		return fmt.Sprint(v), true
+	}
+}
+
+func computeHMACSignature(secret []byte, value string) string {
+	mac := hmac.New(sha256.New, secret)
+	mac.Write([]byte(value))
+	return base64.StdEncoding.EncodeToString(mac.Sum(nil))
+}
+
+func encryptForwardedValue(key []byte, value string) (string, error) {
+	block, err := aes.NewCipher(key)
+	if err != nil {
+		return "", err
+	}
+
+	gcm, err := cipher.NewGCM(block)
+	if err != nil {
+		return "", err
+	}
+
+	nonce := make([]byte, gcm.NonceSize())
+	if _, err := rand.Read(nonce); err != nil {
+		return "", err
+	}
+
+	ciphertext := gcm.Seal(nil, nonce, []byte(value), nil)
+	combined := append(nonce, ciphertext...)
+	return base64.StdEncoding.EncodeToString(combined), nil
+}
+
+func parseClaimPath(path string) ([]claimPathToken, error) {
+	trimmed := strings.TrimSpace(path)
+	if trimmed == "" {
+		return nil, fmt.Errorf("claim path cannot be empty")
+	}
+
+	segments := strings.Split(trimmed, ".")
+	tokens := make([]claimPathToken, 0, len(segments))
+
+	for _, segment := range segments {
+		if segment == "" {
+			return nil, fmt.Errorf("claim path contains empty segment: %s", path)
+		}
+
+		remaining := segment
+		for len(remaining) > 0 {
+			token := claimPathToken{}
+			bracket := strings.IndexByte(remaining, '[')
+			if bracket == -1 {
+				token.key = remaining
+				tokens = append(tokens, token)
+				remaining = ""
+				continue
+			}
+
+			if bracket > 0 {
+				token.key = remaining[:bracket]
+			}
+
+			closing := strings.IndexByte(remaining[bracket:], ']')
+			if closing == -1 {
+				return nil, fmt.Errorf("claim path has unterminated index: %s", path)
+			}
+			closing += bracket
+
+			idxStr := remaining[bracket+1 : closing]
+			if idxStr == "" {
+				return nil, fmt.Errorf("claim path has empty index: %s", path)
+			}
+
+			idx, err := strconv.Atoi(idxStr)
+			if err != nil {
+				return nil, fmt.Errorf("claim path has invalid index %s: %w", idxStr, err)
+			}
+			token.index = &idx
+			tokens = append(tokens, token)
+
+			remaining = remaining[closing+1:]
+			if remaining != "" && remaining[0] != '[' {
+				return nil, fmt.Errorf("claim path has invalid syntax near %s", remaining)
+			}
+		}
+	}
+
+	return tokens, nil
 }
 
 // isUserAuthenticated checks if the user is authenticated by validating their session and token.
@@ -938,6 +1216,10 @@ func (t *TraefikOidc) extractGroupsAndRoles(idToken string) ([]string, []string,
 		return nil, nil, fmt.Errorf("failed to extract claims: %w", err)
 	}
 
+	return t.extractGroupsAndRolesFromClaims(claims)
+}
+
+func (t *TraefikOidc) extractGroupsAndRolesFromClaims(claims map[string]interface{}) ([]string, []string, error) {
 	var groups []string
 	var roles []string
 
